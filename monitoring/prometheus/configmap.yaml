@@ -1,0 +1,521 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      evaluation_interval: 30s
+
+    alerting:
+      alertmanagers:
+      - static_configs:
+        - targets:
+          - alertmanager:9093
+
+    rule_files:
+      - /etc/prometheus/alert.rules.yml
+      - /etc/prometheus/recording.rules.yml
+
+    scrape_configs:
+    - job_name: prometheus
+      static_configs:
+      - targets: ['localhost:9090']
+
+    - job_name: node-exporter
+      static_configs:
+      - targets: ['node-exporter:9100']
+
+    - job_name: kube-state-metrics
+      static_configs:
+      - targets: ['kube-state-metrics:8080']
+
+    - job_name: kubernetes-apiservers
+      kubernetes_sd_configs:
+      - role: endpoints
+      scheme: https
+      tls_config:
+        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        insecure_skip_verify: true
+      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: default;kubernetes;https
+
+    - job_name: kubernetes-nodes
+      scheme: https
+      tls_config:
+        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        insecure_skip_verify: true
+      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      kubernetes_sd_configs:
+      - role: node
+      relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+
+    # cAdvisor DaemonSet — extracts pod_uid from cgroup path for label join
+    - job_name: cadvisor
+      static_configs:
+      - targets: ['cadvisor:8080']
+      metric_relabel_configs:
+      # Extract pod UID from cgroup id (e.g. /kubepods/burstable/pod<uid>/<container>)
+      - source_labels: [id]
+        regex: '.*pod([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}).*'
+        target_label: pod_uid
+        replacement: '$1'
+      # Drop root cgroup and non-pod cgroups (no pod_uid extracted)
+      - source_labels: [pod_uid]
+        regex: '.+'
+        action: keep
+
+    - job_name: kubernetes-pods
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+          - openedx
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+
+  recording.rules.yml: |
+    groups:
+
+    # ── Pods ──────────────────────────────────────────────────────────────────
+    - name: pod-metrics
+      interval: 30s
+      rules:
+      - record: pod:cpu_usage_seconds_total:rate5m
+        expr: |
+          rate(container_cpu_usage_seconds_total[5m])
+          * on(pod_uid) group_left(namespace, pod)
+          label_replace(kube_pod_info{namespace="openedx"}, "pod_uid", "$1", "uid", "(.*)")
+
+      - record: pod:memory_usage_bytes
+        expr: |
+          container_memory_usage_bytes
+          * on(pod_uid) group_left(namespace, pod)
+          label_replace(kube_pod_info{namespace="openedx"}, "pod_uid", "$1", "uid", "(.*)")
+
+      - record: pod:cpu_throttled_ratio
+        expr: |
+          rate(container_cpu_cfs_throttled_seconds_total[5m])
+          / rate(container_cpu_cfs_periods_total[5m])
+          * on(pod_uid) group_left(namespace, pod)
+          label_replace(kube_pod_info{namespace="openedx"}, "pod_uid", "$1", "uid", "(.*)")
+
+      - record: pod:network_receive_bytes:rate5m
+        expr: |
+          rate(container_network_receive_bytes_total[5m])
+          * on(pod_uid) group_left(namespace, pod)
+          label_replace(kube_pod_info{namespace="openedx"}, "pod_uid", "$1", "uid", "(.*)")
+
+      - record: pod:network_transmit_bytes:rate5m
+        expr: |
+          rate(container_network_transmit_bytes_total[5m])
+          * on(pod_uid) group_left(namespace, pod)
+          label_replace(kube_pod_info{namespace="openedx"}, "pod_uid", "$1", "uid", "(.*)")
+
+    # ── Nodes ─────────────────────────────────────────────────────────────────
+    - name: node-metrics
+      interval: 30s
+      rules:
+      - record: node:cpu_usage_ratio
+        expr: 1 - avg by(instance)(irate(node_cpu_seconds_total{mode="idle"}[5m]))
+
+      - record: node:cpu_iowait_ratio
+        expr: avg by(instance)(irate(node_cpu_seconds_total{mode="iowait"}[5m]))
+
+      - record: node:memory_usage_ratio
+        expr: 1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+
+      - record: node:memory_used_bytes
+        expr: node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes
+
+      - record: node:swap_usage_ratio
+        expr: 1 - (node_memory_SwapFree_bytes / node_memory_SwapTotal_bytes)
+
+      # Disk I/O — bytes per second
+      - record: node:disk_read_bytes:rate5m
+        expr: sum by(instance, device)(rate(node_disk_read_bytes_total[5m]))
+
+      - record: node:disk_write_bytes:rate5m
+        expr: sum by(instance, device)(rate(node_disk_written_bytes_total[5m]))
+
+      # Disk I/O — operations per second
+      - record: node:disk_reads_ops:rate5m
+        expr: sum by(instance, device)(rate(node_disk_reads_completed_total[5m]))
+
+      - record: node:disk_writes_ops:rate5m
+        expr: sum by(instance, device)(rate(node_disk_writes_completed_total[5m]))
+
+      # Disk I/O — latency (ms per op)
+      - record: node:disk_read_latency_ms
+        expr: |
+          rate(node_disk_read_time_seconds_total[5m])
+          / rate(node_disk_reads_completed_total[5m]) * 1000
+
+      - record: node:disk_write_latency_ms
+        expr: |
+          rate(node_disk_write_time_seconds_total[5m])
+          / rate(node_disk_writes_completed_total[5m]) * 1000
+
+      # Disk utilisation (% time disk was busy)
+      - record: node:disk_io_util_ratio
+        expr: rate(node_disk_io_time_seconds_total[5m])
+
+      # Filesystem usage
+      - record: node:filesystem_usage_ratio
+        expr: |
+          (node_filesystem_size_bytes - node_filesystem_free_bytes)
+          / node_filesystem_size_bytes
+
+      - record: node:filesystem_used_bytes
+        expr: node_filesystem_size_bytes - node_filesystem_free_bytes
+
+      # Network — throughput bytes/s
+      - record: node:network_receive_bytes:rate5m
+        expr: sum by(instance, device)(rate(node_network_receive_bytes_total{device!~"lo|veth.*|docker.*|flannel.*|cni.*|cbr.*"}[5m]))
+
+      - record: node:network_transmit_bytes:rate5m
+        expr: sum by(instance, device)(rate(node_network_transmit_bytes_total{device!~"lo|veth.*|docker.*|flannel.*|cni.*|cbr.*"}[5m]))
+
+      # Network — packets/s
+      - record: node:network_receive_packets:rate5m
+        expr: sum by(instance, device)(rate(node_network_receive_packets_total{device!~"lo|veth.*|docker.*|flannel.*|cni.*|cbr.*"}[5m]))
+
+      - record: node:network_transmit_packets:rate5m
+        expr: sum by(instance, device)(rate(node_network_transmit_packets_total{device!~"lo|veth.*|docker.*|flannel.*|cni.*|cbr.*"}[5m]))
+
+      # Network — errors and drops
+      - record: node:network_receive_errors:rate5m
+        expr: sum by(instance, device)(rate(node_network_receive_errs_total[5m]))
+
+      - record: node:network_transmit_errors:rate5m
+        expr: sum by(instance, device)(rate(node_network_transmit_errs_total[5m]))
+
+      - record: node:network_receive_drops:rate5m
+        expr: sum by(instance, device)(rate(node_network_receive_drop_total[5m]))
+
+      - record: node:network_transmit_drops:rate5m
+        expr: sum by(instance, device)(rate(node_network_transmit_drop_total[5m]))
+
+    # ── Deployments ───────────────────────────────────────────────────────────
+    - name: deployment-metrics
+      interval: 30s
+      rules:
+      - record: deployment:replicas_desired
+        expr: kube_deployment_spec_replicas
+
+      - record: deployment:replicas_available
+        expr: kube_deployment_status_replicas_available
+
+      - record: deployment:replicas_unavailable
+        expr: kube_deployment_status_replicas_unavailable
+
+      - record: deployment:availability_ratio
+        expr: |
+          kube_deployment_status_replicas_available
+          / kube_deployment_spec_replicas
+
+    # ── Kubernetes Resource Counts ────────────────────────────────────────────
+    - name: k8s-resource-counts
+      interval: 60s
+      rules:
+      - record: k8s:pods:count
+        expr: count by(namespace, phase)(kube_pod_status_phase{namespace="openedx", phase=~"Running|Pending|Failed|Succeeded"} == 1)
+
+      - record: k8s:pods:not_running
+        expr: count by(namespace)(kube_pod_status_phase{namespace="openedx", phase!="Running"} == 1)
+
+      - record: k8s:deployments:count
+        expr: count by(namespace)(kube_deployment_spec_replicas{namespace="openedx"})
+
+      - record: k8s:secrets:count
+        expr: count by(namespace)(kube_secret_info{namespace="openedx"})
+
+      - record: k8s:configmaps:count
+        expr: count by(namespace)(kube_configmap_info{namespace="openedx"})
+
+      - record: k8s:services:count
+        expr: count by(namespace, type)(kube_service_spec_type{namespace="openedx"})
+
+      - record: k8s:pv:count
+        expr: count by(storageclass, phase)(kube_persistentvolume_status_phase == 1)
+
+      - record: k8s:pv:capacity_bytes
+        expr: sum by(storageclass)(kube_persistentvolume_capacity_bytes)
+
+      - record: k8s:pvc:count
+        expr: count by(namespace, phase)(kube_persistentvolumeclaim_status_phase{namespace="openedx"} == 1)
+
+      - record: k8s:pvc:requested_bytes
+        expr: sum by(namespace)(kube_persistentvolumeclaim_resource_requests_storage_bytes{namespace="openedx"})
+
+      - record: k8s:nodes:count
+        expr: count(kube_node_info)
+
+      - record: k8s:nodes:ready
+        expr: count(kube_node_status_condition{condition="Ready",status="true"} == 1)
+
+      - record: k8s:nodes:not_ready
+        expr: count(kube_node_status_condition{condition="Ready",status="true"} == 0)
+
+  alert.rules.yml: |
+    groups:
+
+    # ── Node Alerts ───────────────────────────────────────────────────────────
+    - name: node-alerts
+      rules:
+      - alert: NodeHighCPU
+        expr: node:cpu_usage_ratio * 100 > 1
+        for: 1m
+        labels:
+          severity: warning
+          resource: node
+        annotations:
+          summary: "High CPU on {{ $labels.instance }}"
+          description: "CPU usage {{ printf \"%.1f\" $value }}% > 1%"
+
+      - alert: NodeHighMemory
+        expr: node:memory_usage_ratio * 100 > 1
+        for: 1m
+        labels:
+          severity: warning
+          resource: node
+        annotations:
+          summary: "High Memory on {{ $labels.instance }}"
+          description: "Memory usage {{ printf \"%.1f\" $value }}% > 1%"
+
+      - alert: NodeHighDiskUsage
+        expr: node:filesystem_usage_ratio{mountpoint="/"} * 100 > 80
+        for: 2m
+        labels:
+          severity: warning
+          resource: node
+        annotations:
+          summary: "High Disk usage on {{ $labels.instance }}"
+          description: "Disk {{ $labels.mountpoint }} usage {{ printf \"%.1f\" $value }}% > 80%"
+
+      - alert: NodeHighDiskWriteLatency
+        expr: node:disk_write_latency_ms > 100
+        for: 5m
+        labels:
+          severity: warning
+          resource: node
+        annotations:
+          summary: "High disk write latency on {{ $labels.instance }}"
+          description: "Disk {{ $labels.device }} write latency {{ printf \"%.0f\" $value }}ms > 100ms"
+
+      - alert: NodeHighDiskReadLatency
+        expr: node:disk_read_latency_ms > 100
+        for: 5m
+        labels:
+          severity: warning
+          resource: node
+        annotations:
+          summary: "High disk read latency on {{ $labels.instance }}"
+          description: "Disk {{ $labels.device }} read latency {{ printf \"%.0f\" $value }}ms > 100ms"
+
+      - alert: NodeNetworkErrors
+        expr: node:network_receive_errors:rate5m + node:network_transmit_errors:rate5m > 10
+        for: 2m
+        labels:
+          severity: warning
+          resource: node
+        annotations:
+          summary: "Network errors on {{ $labels.instance }}"
+          description: "{{ printf \"%.0f\" $value }} network errors/s on {{ $labels.device }}"
+
+      - alert: NodeNotReady
+        expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          resource: node
+        annotations:
+          summary: "Node {{ $labels.node }} is Not Ready"
+          description: "Node {{ $labels.node }} has been not ready for more than 1 minute"
+
+      - alert: NodeDiskIOHigh
+        expr: node:disk_io_util_ratio * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+          resource: node
+        annotations:
+          summary: "High disk I/O utilisation on {{ $labels.instance }}"
+          description: "Disk {{ $labels.device }} utilisation {{ printf \"%.0f\" $value }}% > 80%"
+
+    # ── Pod Alerts ────────────────────────────────────────────────────────────
+    - name: pod-alerts
+      rules:
+      - alert: PodCrashLooping
+        expr: rate(kube_pod_container_status_restarts_total{namespace="openedx"}[15m]) * 60 > 0.5
+        for: 5m
+        labels:
+          severity: critical
+          resource: pod
+        annotations:
+          summary: "Pod {{ $labels.pod }} crash-looping"
+          description: "{{ $labels.namespace }}/{{ $labels.pod }} restarting > 0.5 times/min"
+
+      - alert: PodHighCPU
+        expr: sum by(namespace, pod)(pod:cpu_usage_seconds_total:rate5m{namespace="openedx"}) > 0.001
+        for: 1m
+        labels:
+          severity: warning
+          resource: pod
+        annotations:
+          summary: "Pod {{ $labels.pod }} high CPU"
+          description: "{{ $labels.namespace }}/{{ $labels.pod }} using {{ printf \"%.2f\" $value }} cores"
+
+      - alert: PodHighMemory
+        expr: |
+          sum by(namespace, pod)(pod:memory_usage_bytes{namespace="openedx"})
+          / sum by(namespace, pod)(kube_pod_container_resource_limits{namespace="openedx", resource="memory"}) * 100 > 1
+        for: 1m
+        labels:
+          severity: warning
+          resource: pod
+        annotations:
+          summary: "Pod {{ $labels.pod }} memory > 1% of limit"
+          description: "{{ $labels.namespace }}/{{ $labels.pod }} at {{ printf \"%.0f\" $value }}% of memory limit"
+
+      - alert: PodNotRunning
+        expr: kube_pod_status_phase{namespace="openedx", phase=~"Pending|Failed|Unknown"} == 1
+        for: 5m
+        labels:
+          severity: warning
+          resource: pod
+        annotations:
+          summary: "Pod {{ $labels.pod }} not running"
+          description: "{{ $labels.namespace }}/{{ $labels.pod }} phase is {{ $labels.phase }}"
+
+      - alert: PodContainerOOMKilled
+        expr: kube_pod_container_status_last_terminated_reason{namespace="openedx", reason="OOMKilled"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          resource: pod
+        annotations:
+          summary: "Pod {{ $labels.pod }} OOMKilled"
+          description: "{{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }} was OOM killed"
+
+    # ── Deployment Alerts ─────────────────────────────────────────────────────
+    - name: deployment-alerts
+      rules:
+      - alert: DeploymentReplicasMismatch
+        expr: kube_deployment_spec_replicas{namespace="openedx"} != kube_deployment_status_replicas_available{namespace="openedx"}
+        for: 5m
+        labels:
+          severity: warning
+          resource: deployment
+        annotations:
+          summary: "Deployment {{ $labels.deployment }} replica mismatch"
+          description: "{{ $labels.namespace }}/{{ $labels.deployment }}: desired {{ $value }} but not all available"
+
+      - alert: DeploymentUnavailable
+        expr: kube_deployment_status_replicas_unavailable{namespace="openedx"} > 0
+        for: 5m
+        labels:
+          severity: warning
+          resource: deployment
+        annotations:
+          summary: "Deployment {{ $labels.deployment }} has unavailable replicas"
+          description: "{{ $labels.namespace }}/{{ $labels.deployment }} has {{ $value }} unavailable replicas"
+
+      - alert: DeploymentGenerationMismatch
+        expr: kube_deployment_status_observed_generation{namespace="openedx"} != kube_deployment_metadata_generation{namespace="openedx"}
+        for: 10m
+        labels:
+          severity: warning
+          resource: deployment
+        annotations:
+          summary: "Deployment {{ $labels.deployment }} rollout stuck"
+          description: "{{ $labels.namespace }}/{{ $labels.deployment }} rollout has not completed in 10m"
+
+    # ── PV / PVC Alerts ───────────────────────────────────────────────────────
+    - name: storage-alerts
+      rules:
+      - alert: PVCPending
+        expr: kube_persistentvolumeclaim_status_phase{namespace="openedx", phase="Pending"} == 1
+        for: 5m
+        labels:
+          severity: warning
+          resource: pvc
+        annotations:
+          summary: "PVC {{ $labels.persistentvolumeclaim }} pending"
+          description: "{{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} has been Pending for 5m — check storage class"
+
+      - alert: PVFailed
+        expr: kube_persistentvolume_status_phase{phase="Failed"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          resource: pv
+        annotations:
+          summary: "PV {{ $labels.persistentvolume }} failed"
+          description: "PersistentVolume {{ $labels.persistentvolume }} is in Failed state"
+
+      - alert: PVCStorageUsageHigh
+        expr: (kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes) * 100 > 80
+        for: 2m
+        labels:
+          severity: warning
+          resource: pvc
+        annotations:
+          summary: "PVC {{ $labels.persistentvolumeclaim }} storage > 80%"
+          description: "{{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} at {{ printf \"%.1f\" $value }}%"
+
+    # ── Service Alerts ────────────────────────────────────────────────────────
+    - name: service-alerts
+      rules:
+      - alert: ServiceNoEndpoints
+        expr: kube_endpoint_address_available{namespace="openedx"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          resource: service
+        annotations:
+          summary: "Service {{ $labels.endpoint }} has no available endpoints"
+          description: "{{ $labels.namespace }}/{{ $labels.endpoint }} — all pods may be down"
+
+    # ── ConfigMap / Secret Alerts ─────────────────────────────────────────────
+    - name: config-alerts
+      rules:
+      - alert: SecretVersionChanged
+        expr: changes(kube_secret_metadata_resource_version{namespace="openedx"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: info
+          resource: secret
+        annotations:
+          summary: "Secret {{ $labels.secret }} was modified"
+          description: "{{ $labels.namespace }}/{{ $labels.secret }} resource version changed"
+
+      - alert: ConfigMapVersionChanged
+        expr: changes(kube_configmap_metadata_resource_version{namespace="openedx"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: info
+          resource: configmap
+        annotations:
+          summary: "ConfigMap {{ $labels.configmap }} was modified"
+          description: "{{ $labels.namespace }}/{{ $labels.configmap }} resource version changed"

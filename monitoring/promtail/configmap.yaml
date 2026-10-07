@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail-config
+  namespace: monitoring
+data:
+  promtail.yaml: |
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+
+    positions:
+      filename: /tmp/positions.yaml
+
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+
+    scrape_configs:
+
+    # ── All pod logs via Kubernetes SD ────────────────────────────────────────
+    - job_name: kubernetes-pods
+      kubernetes_sd_configs:
+        - role: pod
+      pipeline_stages:
+        # Unwrap Docker JSON log format: {"log":"...","stream":"...","time":"..."}
+        - json:
+            expressions:
+              output: log
+              stream: stream
+              timestamp: time
+        - timestamp:
+            source: timestamp
+            format: RFC3339Nano
+        - output:
+            source: output
+        - labels:
+            stream:
+        # Try to extract log level from structured (JSON) app logs
+        - json:
+            expressions:
+              level: level
+        - labels:
+            level:
+        - match:
+            selector: '{level=""}'
+            stages:
+            - static_labels:
+                level: info
+      relabel_configs:
+        # Only collect logs from openedx namespace
+        - source_labels: [__meta_kubernetes_namespace]
+          action: keep
+          regex: openedx
+        # Drop pods that explicitly opt out
+        - source_labels: [__meta_kubernetes_pod_annotation_promtail_io_scrape]
+          action: drop
+          regex: "false"
+        # Use custom log path annotation if set
+        - source_labels: [__meta_kubernetes_pod_annotation_promtail_io_path]
+          action: replace
+          target_label: __path__
+          regex: (.+)
+        # Default log path: /var/log/pods/<namespace>_<pod>_<uid>/<container>/*.log
+        - source_labels: [__meta_kubernetes_pod_uid, __meta_kubernetes_pod_container_name]
+          action: replace
+          target_label: __path__
+          separator: /
+          replacement: /var/log/pods/*$1/$2/*.log
+        # Kubernetes labels → Loki stream labels
+        - source_labels: [__meta_kubernetes_namespace]
+          target_label: namespace
+        - source_labels: [__meta_kubernetes_pod_name]
+          target_label: pod
+        - source_labels: [__meta_kubernetes_pod_container_name]
+          target_label: container
+        - source_labels: [__meta_kubernetes_pod_label_app]
+          target_label: app
+        - source_labels: [__meta_kubernetes_node_name]
+          target_label: node
+        # Keep the job label clean
+        - replacement: kubernetes-pods
+          target_label: job
+

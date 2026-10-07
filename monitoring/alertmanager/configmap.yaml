@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+data:
+  alertmanager.yml: |
+    global:
+      # ── SMTP settings ─────────────────────────────────────────────────────────
+      smtp_smarthost: 'smtp.office365.com:587'
+      smtp_from: '***************@gmail.com'
+      smtp_auth_username: '***************@gmail.com'
+      smtp_auth_password: '**********'
+      smtp_require_tls: true
+
+    route:
+      group_by: ['alertname', 'instance']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: all-alerts
+
+    receivers:
+    - name: all-alerts
+      email_configs:
+      - to: '***************@gmail.com'
+        send_resolved: true
+        headers:
+          Subject: '[K8s Alert] {{ .GroupLabels.alertname }} - {{ .Status | toUpper }}'
+
+    inhibit_rules:
+    - source_match:
+        severity: critical
+      target_match:
+        severity: warning
+      equal: ['alertname', 'instance']
